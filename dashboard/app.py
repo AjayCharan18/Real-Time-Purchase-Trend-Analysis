@@ -25,6 +25,8 @@ import matplotlib.dates as mdates
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.chart import BarChart, Reference
+from cache_utils import CacheManager
+from background import CacheWarmupTask
 # Amazon API integration removed
 
 # Logging
@@ -49,13 +51,9 @@ HDFS_NAMENODE = os.getenv("HDFS_NAMENODE", "hdfs://hadoop-namenode:8020")
 HDFS_DATA_PATH = os.getenv("HDFS_DATA_PATH", "/purchase-analytics/aggregated")
 UPDATE_INTERVAL = 30  # seconds - reduced for better performance
 
-# Simple cache for dashboard data
-cache = {
-    'products': {'data': None, 'timestamp': None},
-    'departments': {'data': None, 'timestamp': None},
-    'hourly': {'data': None, 'timestamp': None}
-}
-CACHE_TTL = 30  # seconds
+# Cache manager configuration
+cache_manager = CacheManager(ttl=120, default_limit=50)
+CACHE_DEFAULT_LIMIT = cache_manager.default_limit
 
 # Alert system configuration
 alerts_config = {
@@ -148,7 +146,7 @@ class HDFSDataReader:
         rows = (
             df_latest
             .orderBy(F.col("transaction_count").desc(), F.col("total_revenue").desc())
-            .limit(limit)
+            .limit(min(limit, CACHE_DEFAULT_LIMIT))
             .collect()
         )
 
@@ -193,6 +191,7 @@ class HDFSDataReader:
         rows = (
             df_latest
             .orderBy(F.col("total_revenue").desc())
+            .limit(CACHE_DEFAULT_LIMIT)
             .collect()
         )
 
@@ -261,6 +260,16 @@ class HDFSDataReader:
 
 data_reader = HDFSDataReader(HDFS_NAMENODE)
 
+
+def warmup_cache_async():
+    loaders = {
+        'products': lambda: data_reader.read_product_trends(20),
+        'products_full': lambda: data_reader.read_product_trends(50),
+        'departments': data_reader.read_department_trends,
+        'hourly': data_reader.read_hourly_trends,
+    }
+    CacheWarmupTask(cache_manager, loaders).start_async()
+
 def _is_alert_in_cooldown(alert_key: str, now: datetime) -> bool:
     cooldown_seconds = ALERT_COOLDOWNS.get(alert_key, 600)
     cutoff = now - timedelta(seconds=cooldown_seconds)
@@ -280,8 +289,8 @@ def check_alerts():
 
     try:
         # Get current stats
-        products = data_reader.read_product_trends(50)
-        depts = data_reader.read_department_trends()
+        products = cache_manager.get('products_full', lambda: data_reader.read_product_trends(50))
+        depts = cache_manager.get('departments', data_reader.read_department_trends)
         
         # Calculate current metrics
         total_transactions = sum(p.get("transaction_count", 0) for p in products)
@@ -635,63 +644,31 @@ def create_excel_export():
     except Exception as e:
         logger.error(f"Error generating Excel export: {e}")
         return None
-
-@app.route('/')
 def index():
     return render_template('index.html')
 
 @app.route('/api/products/top')
 def api_top_products():
     limit = int(request.args.get('limit', 20))
-    
-    # Check cache first
-    now = time.time()
-    if (cache['products']['data'] is not None and 
-        cache['products']['timestamp'] is not None and 
-        now - cache['products']['timestamp'] < CACHE_TTL):
-        return jsonify(cache['products']['data'][:limit])
-    
-    # Fetch fresh data
-    data = data_reader.read_product_trends(limit)
-    cache['products']['data'] = data
-    cache['products']['timestamp'] = now
-    return jsonify(data)
+
+    data = cache_manager.get('products', lambda: data_reader.read_product_trends(limit))
+    return jsonify(data[:limit])
 
 @app.route('/api/departments')
 def api_departments():
-    # Check cache first
-    now = time.time()
-    if (cache['departments']['data'] is not None and 
-        cache['departments']['timestamp'] is not None and 
-        now - cache['departments']['timestamp'] < CACHE_TTL):
-        return jsonify(cache['departments']['data'])
-    
-    # Fetch fresh data
-    data = data_reader.read_department_trends()
-    cache['departments']['data'] = data
-    cache['departments']['timestamp'] = now
+    data = cache_manager.get('departments', data_reader.read_department_trends)
     return jsonify(data)
 
 @app.route('/api/hourly')
 def api_hourly():
-    # Check cache first
-    now = time.time()
-    if (cache['hourly']['data'] is not None and 
-        cache['hourly']['timestamp'] is not None and 
-        now - cache['hourly']['timestamp'] < CACHE_TTL):
-        return jsonify(cache['hourly']['data'])
-    
-    # Fetch fresh data
-    data = data_reader.read_hourly_trends()
-    cache['hourly']['data'] = data
-    cache['hourly']['timestamp'] = now
+    data = cache_manager.get('hourly', data_reader.read_hourly_trends)
     return jsonify(data)
 
 @app.route('/api/opportunities')
 def api_opportunities():
     """Detect revenue opportunities and sudden trend changes"""
     try:
-        products = data_reader.read_product_trends(50)
+        products = cache_manager.get('products_full', lambda: data_reader.read_product_trends(50))
         
         # Identify revenue opportunities
         opportunities = []
