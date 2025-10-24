@@ -33,6 +33,8 @@ import logging
 import traceback
 import tempfile
 import time
+import shutil
+from pathlib import Path
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     from_json, col, window, count, sum as _sum, avg, max as _max,
@@ -75,6 +77,17 @@ def create_spark_session():
         logger.error("Error creating Spark session: %s", str(e))
         logger.error(traceback.format_exc())
         sys.exit(1)
+
+
+def purge_checkpoint_dir(path: str):
+    try:
+        checkpoint_path = Path(path)
+        if checkpoint_path.exists():
+            shutil.rmtree(checkpoint_path)
+            logger.info(f"Removed stale checkpoint directory: {checkpoint_path}")
+    except Exception as exc:
+        logger.warning(f"Failed to purge checkpoint directory {path}: {exc}")
+
 
 def define_transaction_schema():
     return StructType([
@@ -278,6 +291,10 @@ def main():
         product_checkpoint = os.path.join(checkpoint_base, "product")
         dept_checkpoint = os.path.join(checkpoint_base, "department")
         hourly_checkpoint = os.path.join(checkpoint_base, "hourly")
+
+        if (os.getenv("RESET_CHECKPOINTS_ON_START", "true").lower() in {"true", "1", "yes", "y"}) and checkpoint_base:
+            for target in {checkpoint_base, raw_checkpoint, product_checkpoint, dept_checkpoint, hourly_checkpoint}:
+                purge_checkpoint_dir(target)
 
         spark = create_spark_session()
         schema = define_transaction_schema()

@@ -124,6 +124,7 @@ Open http://localhost:5000 in your browser
 - `KAFKA_TOPIC`: Topic to consume from
 - `HDFS_NAMENODE`: HDFS namenode URL (default: hdfs://hadoop-namenode:8020)
 - `CHECKPOINT_DIR`: Spark checkpoint directory (default: /tmp/spark-checkpoints)
+- `RESET_CHECKPOINTS_ON_START`: When `true` (default), purges local Spark checkpoint directories at container startup to avoid incomplete log errors during development
 
 #### Dashboard Service
 - `FLASK_ENV`: Flask environment (default: development)
@@ -192,6 +193,13 @@ docker compose exec hadoop-namenode hdfs dfs -mkdir -p /purchase-analytics/raw
 docker compose exec hadoop-namenode hdfs dfs -mkdir -p /purchase-analytics/aggregated/by_product
 docker compose exec hadoop-namenode hdfs dfs -mkdir -p /purchase-analytics/aggregated/by_department
 docker compose exec hadoop-namenode hdfs dfs -mkdir -p /purchase-analytics/aggregated/by_hour
+```
+
+4. **Spark streaming fails with incomplete checkpoint logs**
+```bash
+# Remove local checkpoint directories and restart streaming container
+docker compose run --rm spark-streaming bash -lc 'rm -rf /tmp/spark-checkpoints'
+docker compose up -d spark-streaming
 ```
 
 4. **Dashboard not showing data**

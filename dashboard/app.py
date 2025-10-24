@@ -132,7 +132,7 @@ class HDFSDataReader:
     def read_product_trends(self, limit=20):
         df = self._read_parquet("by_product")
         if df is None:
-            logger.warning("Product aggregates missing; returning empty list")
+            logger.warning("Product aggregates missing at expected HDFS location")
             return []
 
         df_latest = self._filter_latest_window(df)
@@ -177,7 +177,7 @@ class HDFSDataReader:
     def read_department_trends(self):
         df = self._read_parquet("by_department")
         if df is None:
-            logger.warning("Department aggregates missing; returning empty list")
+            logger.warning("Department aggregates missing at expected HDFS location")
             return []
 
         df_latest = self._filter_latest_window(df)
@@ -212,15 +212,29 @@ class HDFSDataReader:
     def read_hourly_trends(self):
         df = self._read_parquet("by_hour")
         if df is None:
-            logger.warning("Hourly aggregates missing; returning empty list")
+            logger.warning("Hourly aggregates missing at expected HDFS location")
             return []
 
-        df_latest = self._filter_latest_window(df)
-        rows = (
-            df_latest
-            .orderBy(F.col("hour_of_day"))
-            .collect()
+        cutoff = datetime.utcnow() - timedelta(hours=24)
+        df_recent = df.filter(F.col("window_end") >= F.lit(cutoff))
+        if df_recent.rdd.isEmpty():
+            logger.info("No hourly records within last 24 hours; using full dataset")
+            df_recent = df
+
+        agg_df = (
+            df_recent
+            .groupBy("hour_of_day")
+            .agg(
+                F.sum("transaction_count").alias("transaction_count"),
+                F.sum("total_revenue").alias("total_revenue"),
+                F.sum("active_users").alias("active_users"),
+                F.sum("active_products").alias("active_products"),
+                F.avg("avg_transaction_value").alias("avg_transaction_value")
+            )
+            .orderBy("hour_of_day")
         )
+
+        rows = agg_df.collect()
 
         if not rows:
             logger.warning("No hourly aggregates available in latest window")
@@ -233,13 +247,10 @@ class HDFSDataReader:
                 "hour_of_day": int(row.hour_of_day or 0),
                 "transaction_count": int(row.transaction_count or 0),
                 "total_revenue": round(float(row.total_revenue or 0.0), 2),
-                "avg_transaction_value": round(float(row.avg_transaction_value or 0.0), 2),
+                "avg_transaction_value": round(float(row.total_revenue or 0.0) / row.transaction_count, 2) if row.transaction_count else 0.0,
                 "avg_price": round(float(row.avg_transaction_value or 0.0), 2),
                 "active_users": int(row.active_users or 0),
-                "active_products": int(row.active_products or 0),
-                "window_start": row.window_start.isoformat() if getattr(row, "window_start", None) else None,
-                "window_end": row.window_end.isoformat() if getattr(row, "window_end", None) else None,
-                "processing_time": row.processing_time.isoformat() if getattr(row, "processing_time", None) else None
+                "active_products": int(row.active_products or 0)
             })
 
         return hourly
