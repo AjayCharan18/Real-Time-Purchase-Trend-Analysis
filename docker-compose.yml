@@ -1,0 +1,275 @@
+networks:
+  purchase-analytics-network:
+    driver: bridge
+    driver_opts:
+      com.docker.network.enable_ipv4: "true"
+      com.docker.network.enable_ipv6: "false"
+
+volumes:
+  hadoop-namenode-data:
+  hadoop-datanode-data:
+  kafka-data:
+  zookeeper-data:
+  zookeeper-log:
+  spark-logs:
+
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    hostname: zookeeper
+    networks:
+      - purchase-analytics-network
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: "2181"
+      ZOOKEEPER_TICK_TIME: "2000"
+      ZOOKEEPER_SYNC_LIMIT: "2"
+      ZOOKEEPER_DATA_DIR: "/var/lib/zookeeper/data"
+      ZOOKEEPER_DATA_LOG_DIR: "/var/lib/zookeeper/log"
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
+    healthcheck:
+      test: [ "CMD", "bash", "-lc", "echo > /dev/tcp/localhost/2181" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    hostname: kafka
+    networks:
+      - purchase-analytics-network
+    ports:
+      - "29092:29092"
+      - "9092:9092"
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: "1"
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_NUM_PARTITIONS: "1"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: "168"
+      KAFKA_LOG_RETENTION_BYTES: "1073741824"
+      KAFKA_LOG_SEGMENT_BYTES: "1073741824"
+      KAFKA_MESSAGE_MAX_BYTES: "10485760"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: [ "CMD", "bash", "-lc", "(echo > /dev/tcp/localhost/9092) || (echo > /dev/tcp/localhost/29092)" ]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+
+  hadoop-namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: hadoop-namenode
+    hostname: hadoop-namenode
+    networks:
+      - purchase-analytics-network
+    ports:
+      - "9870:9870"
+      - "8020:8020"
+    environment:
+      CLUSTER_NAME: "purchase-analytics"
+      CORE_CONF_fs_defaultFS: "hdfs://hadoop-namenode:8020"
+      CORE_CONF_hadoop_http_staticuser_user: "root"
+      CORE_CONF_hadoop_proxyuser_hue_hosts: "*"
+      CORE_CONF_hadoop_proxyuser_hue_groups: "*"
+      HDFS_CONF_dfs_replication: "1"
+      HDFS_CONF_dfs_namenode_datanode_registration_ip___hostname___check: "false"
+      HDFS_CONF_dfs_permissions_enabled: "false"
+      HDFS_CONF_dfs_webhdfs_enabled: "true"
+    volumes:
+      - hadoop-namenode-data:/hadoop/dfs/name
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9870" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  hadoop-datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: hadoop-datanode
+    hostname: hadoop-datanode
+    networks:
+      - purchase-analytics-network
+    ports:
+      - "9864:9864"
+    environment:
+      CLUSTER_NAME: "purchase-analytics"
+      CORE_CONF_fs_defaultFS: "hdfs://hadoop-namenode:8020"
+      CORE_CONF_hadoop_http_staticuser_user: "root"
+      HDFS_CONF_dfs_replication: "1"
+      HDFS_CONF_dfs_datanode_data_dir: "file:///hadoop/dfs/data"
+    depends_on:
+      hadoop-namenode:
+        condition: service_healthy
+    volumes:
+      - hadoop-datanode-data:/hadoop/dfs/data
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9864" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  spark-master:
+    image: apache/spark:3.5.2
+    container_name: spark-master
+    hostname: spark-master
+    networks:
+      - purchase-analytics-network
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+      - "4040:4040"
+    environment:
+      SPARK_MODE: "master"
+      SPARK_MASTER_WEBUI_PORT: "8080"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+    volumes:
+      - ./spark/apps:/opt/spark-apps
+      - spark-logs:/opt/spark/logs
+      - ./data:/opt/spark-data
+    command: [ "/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master", "--host", "spark-master", "--port", "7077", "--webui-port", "8080" ]
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  spark-worker:
+    image: apache/spark:3.5.2
+    container_name: spark-worker
+    hostname: spark-worker
+    networks:
+      - purchase-analytics-network
+    ports:
+      - "8081:8081"
+    environment:
+      SPARK_MODE: "worker"
+      SPARK_MASTER_URL: "spark://spark-master:7077"
+      SPARK_WORKER_MEMORY: "1G"
+      SPARK_WORKER_CORES: "1"
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+          cpus: '1.0'
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    volumes:
+      - ./spark/apps:/opt/spark-apps
+      - spark-logs:/opt/spark/logs
+      - ./data:/opt/spark-data
+    command: [ "/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077" ]
+    healthcheck:
+      disable: true
+
+  producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: kafka-producer
+    hostname: producer
+    networks:
+      - purchase-analytics-network
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      KAFKA_TOPIC: "purchase-transactions"
+      DATA_PATH: "/app/data"
+      PRODUCER_DATA_MODE: "synthetic"
+      PRODUCER_RATE: "50"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+    volumes:
+      - ./data:/app/data
+      - ./logs/producer:/app/logs
+    command: python kafka_producer.py
+
+  spark-streaming:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-streaming
+    hostname: spark-streaming
+    networks:
+      - purchase-analytics-network
+    depends_on:
+      kafka:
+        condition: service_healthy
+      hadoop-namenode:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+    environment:
+      SPARK_MASTER_URL: "spark://spark-master:7077"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      KAFKA_TOPIC: "purchase-transactions"
+      HDFS_NAMENODE: "hdfs://hadoop-namenode:8020"
+      CHECKPOINT_DIR: "/tmp/spark-checkpoints"
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+          cpus: '1.0'
+    volumes:
+      - ./spark/apps:/opt/spark-apps
+      - ./data:/opt/spark-data
+      - ./logs/spark:/opt/spark/logs
+      - ./caches/ivy2:/root/.ivy2
+      - ./caches/m2:/root/.m2
+    command: [ "spark-submit", "--master", "spark://spark-master:7077", "--packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.2", "/opt/spark-apps/streaming_consumer.py" ]
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: dashboard
+    hostname: dashboard
+    networks:
+      - purchase-analytics-network
+    ports:
+      - "5000:5000"
+    depends_on:
+      - hadoop-namenode
+    environment:
+      FLASK_APP: "app.py"
+      FLASK_ENV: "development"
+      HDFS_NAMENODE: "hdfs://hadoop-namenode:8020"
+      HDFS_DATA_PATH: "/purchase-analytics/aggregated"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+    volumes:
+      - ./dashboard:/app
+      - ./logs/dashboard:/app/logs
+    command: [ "python", "app.py" ]

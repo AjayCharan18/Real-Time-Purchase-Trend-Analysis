@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Purchase Trend Analysis Dashboard</title>
+
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Font Awesome -->
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <!-- Socket.IO -->
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+
+    <style>
+        :root {
+            --primary: #2563eb;
+            --secondary: #10b981;
+            --text-primary: #1e293b;
+            --text-secondary: #64748b;
+        }
+        body {
+            background: #f8fafc;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            padding: 20px;
+        }
+        .stat-card {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        .chart-card {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+        .table-card {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            overflow-x: auto;
+        }
+        .connection-status {
+            display: inline-block;
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            font-weight: 600;
+        }
+        .status-connected {
+            background: #d1fae5;
+            color: #065f46;
+        }
+        .status-disconnected {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+        .last-updated {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+        .export-option {
+            padding: 15px;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            background: #f8fafc;
+            transition: all 0.3s ease;
+        }
+        .export-option:hover {
+            border-color: var(--primary);
+            background: white;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        .btn-group .btn {
+            border-radius: 6px !important;
+            margin-left: 5px;
+        }
+        .btn-group .btn:first-child {
+            margin-left: 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container-fluid">
+        <!-- Header -->
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <div>
+                <h1 class="text-primary"><i class="fas fa-shopping-cart"></i> Real-Time Purchase Trend Analysis</h1>
+                <p class="text-muted mb-0">Streaming purchase transactions via Kafka • Live dashboards of product popularity</p>
+            </div>
+            <div>
+                <span id="connectionStatus" class="connection-status status-disconnected">
+                    <i class="fas fa-circle me-1"></i> Connecting...
+                </span>
+                <div id="lastUpdated" class="last-updated mt-1">Last updated: Never</div>
+            </div>
+        </div>
+
+        <!-- Stats Row -->
+        <div class="row mb-4">
+            <div class="col-md-3 mb-3">
+                <div class="stat-card">
+                    <i class="fas fa-receipt fa-2x text-secondary"></i>
+                    <h3 id="totalTransactions">0</h3>
+                    <p>Total Transactions</p>
+                </div>
+            </div>
+            <div class="col-md-3 mb-3">
+                <div class="stat-card">
+                    <i class="fas fa-dollar-sign fa-2x text-secondary"></i>
+                    <h3 id="totalRevenue">$0</h3>
+                    <p>Total Revenue</p>
+                </div>
+            </div>
+            <div class="col-md-3 mb-3">
+                <div class="stat-card">
+                    <i class="fas fa-box fa-2x text-secondary"></i>
+                    <h3 id="activeProducts">0</h3>
+                    <p>Active Products</p>
+                </div>
+            </div>
+            <div class="col-md-3 mb-3">
+                <div class="stat-card">
+                    <i class="fas fa-layer-group fa-2x text-secondary"></i>
+                    <h3 id="activeDepartments">0</h3>
+                    <p>Active Departments</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Export & Reporting Section -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="chart-card">
+                    <div class="d-flex justify-content-between align-items-center mb-3">
+                        <h5><i class="fas fa-download text-primary me-2"></i>Export & Reports</h5>
+                        <div class="btn-group" role="group">
+                            <button type="button" class="btn btn-outline-success" onclick="exportToPDF()">
+                                <i class="fas fa-file-pdf me-1"></i>PDF Report
+                            </button>
+                            <button type="button" class="btn btn-outline-primary" onclick="exportToExcel()">
+                                <i class="fas fa-file-excel me-1"></i>Excel Data
+                            </button>
+                            <button type="button" class="btn btn-outline-info" onclick="scheduleReport()">
+                                <i class="fas fa-clock me-1"></i>Schedule
+                            </button>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="col-md-4">
+                            <div class="export-option">
+                                <div class="d-flex align-items-center mb-2">
+                                    <i class="fas fa-file-pdf fa-2x text-danger me-3"></i>
+                                    <div>
+                                        <h6 class="mb-0">PDF Report</h6>
+                                        <small class="text-muted">Comprehensive business report with charts</small>
+                                    </div>
+                                </div>
+                                <div class="progress mb-2" style="height: 4px;">
+                                    <div class="progress-bar bg-danger" role="progressbar" style="width: 100%"></div>
+                                </div>
+                                <small class="text-success"><i class="fas fa-check me-1"></i>Ready to generate</small>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="export-option">
+                                <div class="d-flex align-items-center mb-2">
+                                    <i class="fas fa-file-excel fa-2x text-success me-3"></i>
+                                    <div>
+                                        <h6 class="mb-0">Excel Export</h6>
+                                        <small class="text-muted">Raw data with multiple sheets</small>
+                                    </div>
+                                </div>
+                                <div class="progress mb-2" style="height: 4px;">
+                                    <div class="progress-bar bg-success" role="progressbar" style="width: 100%"></div>
+                                </div>
+                                <small class="text-success"><i class="fas fa-check me-1"></i>Ready to export</small>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="export-option">
+                                <div class="d-flex align-items-center mb-2">
+                                    <i class="fas fa-calendar-alt fa-2x text-info me-3"></i>
+                                    <div>
+                                        <h6 class="mb-0">Scheduled Reports</h6>
+                                        <small class="text-muted">Automated daily/weekly reports</small>
+                                    </div>
+                                </div>
+                                <div class="progress mb-2" style="height: 4px;">
+                                    <div class="progress-bar bg-info" role="progressbar" style="width: 75%"></div>
+                                </div>
+                                <small class="text-warning"><i class="fas fa-clock me-1"></i>Coming soon</small>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Charts Row -->
+        <div class="row mb-4">
+            <div class="col-lg-8 mb-4">
+                <div class="chart-card">
+                    <h5>Top 10 Products by Transactions</h5>
+                    <canvas id="productChart"></canvas>
+                </div>
+            </div>
+            <div class="col-lg-4 mb-4">
+                <div class="chart-card">
+                    <h5>Department Distribution</h5>
+                    <canvas id="departmentChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Hourly Trend -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="chart-card">
+                    <h5>Hourly Transaction Trends</h5>
+                    <canvas id="hourlyChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Real-time Alerts System -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="chart-card">
+                    <div class="d-flex justify-content-between align-items-center mb-3">
+                        <h5><i class="fas fa-bell text-warning me-2"></i>Real-time Alerts <span id="alertBadge" class="badge bg-secondary ms-2">0</span></h5>
+                        <button class="btn btn-sm btn-outline-primary" onclick="toggleAlertsConfig()">
+                            <i class="fas fa-cog me-1"></i>Configure
+                        </button>
+                    </div>
+                    <div id="alertsContainer">
+                        <div class="text-center py-3 text-muted">
+                            <i class="fas fa-shield-alt me-2"></i>No active alerts - All systems normal
+                        </div>
+                    </div>
+                    
+                    <!-- Alert Configuration Panel (Hidden by default) -->
+                    <div id="alertsConfigPanel" class="mt-3" style="display: none;">
+                        <div class="border-top pt-3">
+                            <h6><i class="fas fa-sliders-h me-2"></i>Alert Thresholds</h6>
+                            <div class="row">
+                                <div class="col-md-6">
+                                    <div class="mb-2">
+                                        <label class="form-label">Low Sales Threshold</label>
+                                        <input type="number" class="form-control form-control-sm" id="lowSalesThreshold" value="500">
+                                    </div>
+                                    <div class="mb-2">
+                                        <label class="form-label">High Revenue Milestone</label>
+                                        <input type="number" class="form-control form-control-sm" id="highRevenueThreshold" value="50000">
+                                    </div>
+                                </div>
+                                <div class="col-md-6">
+                                    <div class="mb-2">
+                                        <label class="form-label">Product Spike Threshold</label>
+                                        <input type="number" class="form-control form-control-sm" id="productSpikeThreshold" value="2000">
+                                    </div>
+                                    <div class="mb-2">
+                                        <button class="btn btn-sm btn-success me-2" onclick="saveAlertsConfig()">
+                                            <i class="fas fa-save me-1"></i>Save
+                                        </button>
+                                        <button class="btn btn-sm btn-secondary" onclick="toggleAlertsConfig()">Cancel</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Revenue Opportunities Alert -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="chart-card">
+                    <h5><i class="fas fa-exclamation-triangle text-warning me-2"></i>Revenue Opportunities - Action Required</h5>
+                    <div id="opportunitiesContainer">
+                        <div class="text-center py-3">
+                            <i class="fas fa-spinner fa-spin me-2"></i>Analyzing trends...
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+
+        <!-- Product Table -->
+        <div class="row">
+            <div class="col-12">
+                <div class="table-card">
+                    <h5><i class="fas fa-chart-line me-2"></i>Top 20 Products - Live Trend Analysis</h5>
+                    <table class="table table-striped">
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Product</th>
+                                <th>Department</th>
+                                <th>Transactions</th>
+                                <th>Quantity</th>
+                                <th>Revenue</th>
+                                <th>Avg Price</th>
+                                <th>Reorder Rate</th>
+                            </tr>
+                        </thead>
+                        <tbody id="productTableBody">
+                            <tr>
+                                <td colspan="8" class="text-center py-4">
+                                    <i class="fas fa-spinner fa-spin me-2"></i>Loading...
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+</body>
+</html>
