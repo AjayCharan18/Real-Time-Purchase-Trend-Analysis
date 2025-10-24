@@ -65,6 +65,15 @@ alerts_config = {
     'department_drop': {'threshold': 0.8, 'enabled': True, 'message': 'Department performance drop detected'}
 }
 
+# Cooldown (seconds) before re-emitting same alert key
+ALERT_COOLDOWNS = {
+    'low_sales': 900,            # 15 minutes
+    'high_revenue': 1800,        # 30 minutes
+    'product_spike': 900,
+    'department_drop': 1200      # 20 minutes
+}
+MAX_ACTIVE_ALERTS = 50
+
 # Active alerts storage
 active_alerts = []
 
@@ -215,21 +224,16 @@ class HDFSDataReader:
             logger.warning("Hourly aggregates missing at expected HDFS location")
             return []
 
-        cutoff = datetime.utcnow() - timedelta(hours=24)
-        df_recent = df.filter(F.col("window_end") >= F.lit(cutoff))
-        if df_recent.rdd.isEmpty():
-            logger.info("No hourly records within last 24 hours; using full dataset")
-            df_recent = df
-
         agg_df = (
-            df_recent
+            df
             .groupBy("hour_of_day")
             .agg(
                 F.sum("transaction_count").alias("transaction_count"),
                 F.sum("total_revenue").alias("total_revenue"),
-                F.sum("active_users").alias("active_users"),
-                F.sum("active_products").alias("active_products"),
-                F.avg("avg_transaction_value").alias("avg_transaction_value")
+                F.avg("avg_transaction_value").alias("avg_transaction_value"),
+                F.avg("avg_transaction_value").alias("avg_price"),
+                F.avg("active_users").alias("active_users"),
+                F.avg("active_products").alias("active_products")
             )
             .orderBy("hour_of_day")
         )
@@ -247,20 +251,33 @@ class HDFSDataReader:
                 "hour_of_day": int(row.hour_of_day or 0),
                 "transaction_count": int(row.transaction_count or 0),
                 "total_revenue": round(float(row.total_revenue or 0.0), 2),
-                "avg_transaction_value": round(float(row.total_revenue or 0.0) / row.transaction_count, 2) if row.transaction_count else 0.0,
-                "avg_price": round(float(row.avg_transaction_value or 0.0), 2),
-                "active_users": int(row.active_users or 0),
-                "active_products": int(row.active_products or 0)
+                "avg_transaction_value": round(float(row.avg_transaction_value or 0.0), 2),
+                "avg_price": round(float(row.avg_price or 0.0), 2),
+                "active_users": int(round(row.active_users or 0)),
+                "active_products": int(round(row.active_products or 0))
             })
 
         return hourly
 
 data_reader = HDFSDataReader(HDFS_NAMENODE)
 
+def _is_alert_in_cooldown(alert_key: str, now: datetime) -> bool:
+    cooldown_seconds = ALERT_COOLDOWNS.get(alert_key, 600)
+    cutoff = now - timedelta(seconds=cooldown_seconds)
+    for alert in active_alerts:
+        if alert.get('key') == alert_key:
+            try:
+                ts = datetime.fromisoformat(alert['timestamp'])
+                if ts >= cutoff:
+                    return True
+            except Exception:
+                continue
+    return False
+
 def check_alerts():
     """Check for alert conditions and generate alerts"""
     global active_alerts
-    
+
     try:
         # Get current stats
         products = data_reader.read_product_trends(50)
@@ -276,63 +293,78 @@ def check_alerts():
         
         # Check low sales alert
         if alerts_config['low_sales']['enabled'] and total_transactions < alerts_config['low_sales']['threshold']:
-            new_alerts.append({
-                'id': f"low_sales_{int(current_time.timestamp())}",
-                'type': 'warning',
-                'title': 'Low Sales Alert',
-                'message': f"Total transactions ({total_transactions:,}) below threshold ({alerts_config['low_sales']['threshold']:,})",
-                'timestamp': current_time.isoformat(),
-                'severity': 'medium'
-            })
-        
+            alert_key = 'low_sales'
+            if not _is_alert_in_cooldown(alert_key, current_time):
+                new_alerts.append({
+                    'key': alert_key,
+                    'id': f"low_sales_{int(current_time.timestamp())}",
+                    'type': 'warning',
+                    'title': 'Low Sales Alert',
+                    'message': f"Total transactions ({total_transactions:,}) below threshold ({alerts_config['low_sales']['threshold']:,})",
+                    'timestamp': current_time.isoformat(),
+                    'severity': 'medium'
+                })
+
         # Check high revenue milestone
         if alerts_config['high_revenue']['enabled'] and total_revenue > alerts_config['high_revenue']['threshold']:
-            new_alerts.append({
-                'id': f"high_revenue_{int(current_time.timestamp())}",
-                'type': 'success',
-                'title': 'Revenue Milestone!',
-                'message': f"Congratulations! Revenue reached ${total_revenue:,.2f}",
-                'timestamp': current_time.isoformat(),
-                'severity': 'high'
-            })
-        
+            alert_key = 'high_revenue'
+            if not _is_alert_in_cooldown(alert_key, current_time):
+                new_alerts.append({
+                    'key': alert_key,
+                    'id': f"high_revenue_{int(current_time.timestamp())}",
+                    'type': 'success',
+                    'title': 'Revenue Milestone!',
+                    'message': f"Congratulations! Revenue reached ${total_revenue:,.2f}",
+                    'timestamp': current_time.isoformat(),
+                    'severity': 'high'
+                })
+
         # Check product spike
         if top_product and alerts_config['product_spike']['enabled'] and top_product.get("transaction_count", 0) > alerts_config['product_spike']['threshold']:
-            new_alerts.append({
-                'id': f"product_spike_{int(current_time.timestamp())}",
-                'type': 'info',
-                'title': 'Product Demand Spike',
-                'message': f"{top_product['product_name']} has {top_product['transaction_count']:,} transactions - consider increasing stock!",
-                'timestamp': current_time.isoformat(),
-                'severity': 'high'
-            })
-        
+            alert_key = f"product_spike_{top_product['product_id']}"
+            if not _is_alert_in_cooldown(alert_key, current_time):
+                new_alerts.append({
+                    'key': alert_key,
+                    'id': f"product_spike_{int(current_time.timestamp())}",
+                    'type': 'info',
+                    'title': 'Product Demand Spike',
+                    'message': f"{top_product['product_name']} has {top_product['transaction_count']:,} transactions - consider increasing stock!",
+                    'timestamp': current_time.isoformat(),
+                    'severity': 'high'
+                })
+
         # Check department performance drop
         if len(depts) > 1:
             avg_dept_revenue = sum(d.get("total_revenue", 0) for d in depts) / len(depts)
             for dept in depts:
                 dept_revenue = dept.get("total_revenue", 0)
                 if dept_revenue < (avg_dept_revenue * alerts_config['department_drop']['threshold']):
-                    new_alerts.append({
-                        'id': f"dept_drop_{dept['department']}_{int(current_time.timestamp())}",
-                        'type': 'warning',
-                        'title': 'Department Performance Drop',
-                        'message': f"{dept['department'].title()} department revenue (${dept_revenue:,.2f}) is below average",
-                        'timestamp': current_time.isoformat(),
-                        'severity': 'medium'
-                    })
-        
+                    alert_key = f"department_drop_{dept['department']}"
+                    if not _is_alert_in_cooldown(alert_key, current_time):
+                        new_alerts.append({
+                            'key': alert_key,
+                            'id': f"dept_drop_{dept['department']}_{int(current_time.timestamp())}",
+                            'type': 'warning',
+                            'title': 'Department Performance Drop',
+                            'message': f"{dept['department'].title()} department revenue (${dept_revenue:,.2f}) is below average",
+                            'timestamp': current_time.isoformat(),
+                            'severity': 'medium'
+                        })
+
         # Add new alerts and keep only recent ones (last 24 hours)
         cutoff_time = current_time - timedelta(hours=24)
         active_alerts = [alert for alert in active_alerts 
                         if datetime.fromisoformat(alert['timestamp']) > cutoff_time]
-        
+
         # Add new unique alerts
         existing_ids = {alert['id'] for alert in active_alerts}
         for alert in new_alerts:
             if alert['id'] not in existing_ids:
                 active_alerts.append(alert)
-        
+
+        # Keep most recent alerts capped to avoid UI overload
+        active_alerts = sorted(active_alerts, key=lambda a: a.get('timestamp', ''), reverse=True)[:MAX_ACTIVE_ALERTS]
+
         logger.info(f"Alert check completed. {len(new_alerts)} new alerts, {len(active_alerts)} total active")
         
     except Exception as e:
