@@ -3,12 +3,14 @@ import os
 import logging
 import time
 import threading
+import posixpath
 from datetime import datetime, timedelta
 from flask import Flask, render_template, jsonify, request, send_file, make_response
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 import pandas as pd
 from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 import io
 import base64
 from reportlab.lib import colors
@@ -68,7 +70,9 @@ active_alerts = []
 
 class HDFSDataReader:
     def __init__(self, hdfs_namenode):
-        self.hdfs_namenode = hdfs_namenode
+        self.hdfs_namenode = (hdfs_namenode or "hdfs://hadoop-namenode:8020").rstrip('/')
+        data_path = (HDFS_DATA_PATH or "/purchase-analytics/aggregated").strip('/')
+        self._aggregate_root = data_path or "purchase-analytics/aggregated"
         self.spark = None
         self._init_spark()
 
@@ -96,82 +100,149 @@ class HDFSDataReader:
             logger.error(f"Failed to initialize Spark: {e}")
             self.spark = None
 
-    def read_product_trends(self, limit=20):
-        # Use mock data for instant response - real data processing is too slow for dashboard
-        logger.info("Using optimized mock data for fast dashboard response")
-        return self._get_mock_product_data(limit)
+    def _full_path(self, relative_path: str) -> str:
+        relative = (relative_path or "").strip('/')
+        return posixpath.join(self.hdfs_namenode, self._aggregate_root, relative)
 
-    def _get_mock_product_data(self, limit=20):
-        """Generate mock product data for demonstration"""
-        import random
-        products = [
-            {"product_name": "Organic Bananas", "department": "produce", "transaction_count": 1250, "total_revenue": 3125.50, "avg_price": 2.50, "reorder_rate": 85, "quantity": 2450},
-            {"product_name": "Whole Milk", "department": "dairy eggs", "transaction_count": 980, "total_revenue": 3920.00, "avg_price": 4.00, "reorder_rate": 92, "quantity": 1960},
-            {"product_name": "Organic Strawberries", "department": "produce", "transaction_count": 875, "total_revenue": 6125.00, "avg_price": 7.00, "reorder_rate": 78, "quantity": 1750},
-            {"product_name": "Organic Baby Spinach", "department": "produce", "transaction_count": 720, "total_revenue": 2880.00, "avg_price": 4.00, "reorder_rate": 65, "quantity": 1440},
-            {"product_name": "Organic Avocado", "department": "produce", "transaction_count": 650, "total_revenue": 1950.00, "avg_price": 3.00, "reorder_rate": 70, "quantity": 1300},
-            {"product_name": "Large Lemon", "department": "produce", "transaction_count": 580, "total_revenue": 1160.00, "avg_price": 2.00, "reorder_rate": 55, "quantity": 1160},
-            {"product_name": "Organic Whole Milk", "department": "dairy eggs", "transaction_count": 520, "total_revenue": 2340.00, "avg_price": 4.50, "reorder_rate": 88, "quantity": 1040},
-            {"product_name": "Organic Raspberries", "department": "produce", "transaction_count": 480, "total_revenue": 2400.00, "avg_price": 5.00, "reorder_rate": 62, "quantity": 960},
-            {"product_name": "Organic Yellow Onions", "department": "produce", "transaction_count": 450, "total_revenue": 675.00, "avg_price": 1.50, "reorder_rate": 80, "quantity": 900},
-            {"product_name": "Organic Garlic", "department": "produce", "transaction_count": 420, "total_revenue": 1260.00, "avg_price": 3.00, "reorder_rate": 75, "quantity": 840}
-        ]
-        # Add some randomness to simulate live data
-        for product in products[:limit]:
-            variance = random.randint(-50, 100)
-            product["transaction_count"] += variance
-            product["quantity"] += variance * 2  # Assume avg 2 items per transaction
-            product["total_revenue"] = round(product["transaction_count"] * product["avg_price"], 2)
-            # Ensure no negative values
-            product["transaction_count"] = max(1, product["transaction_count"])
-            product["quantity"] = max(1, product["quantity"])
-        return products[:limit]
+    def _read_parquet(self, relative_path: str):
+        if not self.spark:
+            return None
+
+        full_path = self._full_path(relative_path)
+        try:
+            df = self.spark.read.parquet(full_path)
+            if not df.take(1):
+                logger.warning(f"No records found at {full_path}")
+                return None
+            return df
+        except Exception as e:
+            logger.warning(f"Unable to read parquet data at {full_path}: {e}")
+            return None
+
+    @staticmethod
+    def _filter_latest_window(df):
+        try:
+            latest = df.select("window_end").orderBy(F.col("window_end").desc()).limit(1).head()
+            if latest and latest.window_end:
+                return df.filter(F.col("window_end") == latest.window_end)
+        except Exception as exc:
+            logger.warning(f"Failed to determine latest window: {exc}")
+        return df
+
+    def read_product_trends(self, limit=20):
+        df = self._read_parquet("by_product")
+        if df is None:
+            logger.warning("Product aggregates missing; returning empty list")
+            return []
+
+        df_latest = self._filter_latest_window(df)
+        rows = (
+            df_latest
+            .orderBy(F.col("transaction_count").desc(), F.col("total_revenue").desc())
+            .limit(limit)
+            .collect()
+        )
+
+        if not rows:
+            logger.warning("No product aggregates available in latest window")
+            return []
+
+        products = []
+        for row in rows:
+            transaction_count = int(row.transaction_count or 0)
+            reorder_rate = 0
+            if transaction_count > 0 and row.reorder_count is not None:
+                reorder_rate = int(round((row.reorder_count / transaction_count) * 100))
+
+            products.append({
+                "product_id": row.product_id,
+                "product_name": row.product_name,
+                "department": row.department,
+                "transaction_count": transaction_count,
+                "total_quantity": int(row.total_quantity or 0),
+                "quantity": int(row.total_quantity or 0),
+                "total_revenue": round(float(row.total_revenue or 0.0), 2),
+                "avg_price": round(float(row.avg_price or 0.0), 2),
+                "reorder_count": int(row.reorder_count or 0),
+                "reorder_rate": reorder_rate,
+                "unique_customers": int(row.unique_customers or 0),
+                "latest_purchase": row.latest_purchase.isoformat() if getattr(row, "latest_purchase", None) else None,
+                "window_start": row.window_start.isoformat() if getattr(row, "window_start", None) else None,
+                "window_end": row.window_end.isoformat() if getattr(row, "window_end", None) else None,
+                "processing_time": row.processing_time.isoformat() if getattr(row, "processing_time", None) else None
+            })
+
+        return products
 
     def read_department_trends(self):
-        # Use mock data for instant response
-        logger.info("Using optimized mock data for department trends")
-        return self._get_mock_department_data()
+        df = self._read_parquet("by_department")
+        if df is None:
+            logger.warning("Department aggregates missing; returning empty list")
+            return []
 
-    def _get_mock_department_data(self):
-        """Generate mock department data"""
-        import random
-        departments = [
-            {"department": "produce", "total_revenue": 15420.50, "transaction_count": 3250, "avg_price": 4.75},
-            {"department": "dairy eggs", "total_revenue": 12890.00, "transaction_count": 2180, "avg_price": 5.91},
-            {"department": "beverages", "total_revenue": 8750.25, "transaction_count": 1950, "avg_price": 4.49},
-            {"department": "meat seafood", "total_revenue": 7650.75, "transaction_count": 980, "avg_price": 7.81},
-            {"department": "pantry", "total_revenue": 6420.00, "transaction_count": 1680, "avg_price": 3.82},
-            {"department": "bakery", "total_revenue": 4890.50, "transaction_count": 1250, "avg_price": 3.91}
-        ]
-        for dept in departments:
-            variance = random.uniform(-500, 1000)
-            count_variance = random.randint(-100, 200)
-            dept["total_revenue"] = round(dept["total_revenue"] + variance, 2)
-            dept["transaction_count"] = max(1, dept["transaction_count"] + count_variance)
-            dept["avg_price"] = round(dept["total_revenue"] / dept["transaction_count"], 2)
+        df_latest = self._filter_latest_window(df)
+        rows = (
+            df_latest
+            .orderBy(F.col("total_revenue").desc())
+            .collect()
+        )
+
+        if not rows:
+            logger.warning("No department aggregates available in latest window")
+            return []
+
+        departments = []
+        for row in rows:
+            departments.append({
+                "department": row.department,
+                "transaction_count": int(row.transaction_count or 0),
+                "total_quantity": int(row.total_quantity or 0),
+                "total_revenue": round(float(row.total_revenue or 0.0), 2),
+                "avg_order_value": round(float(row.avg_order_value or 0.0), 2),
+                "avg_price": round(float(row.avg_order_value or 0.0), 2),
+                "unique_users": int(row.unique_users or 0),
+                "unique_products": int(row.unique_products or 0),
+                "window_start": row.window_start.isoformat() if getattr(row, "window_start", None) else None,
+                "window_end": row.window_end.isoformat() if getattr(row, "window_end", None) else None,
+                "processing_time": row.processing_time.isoformat() if getattr(row, "processing_time", None) else None
+            })
+
         return departments
 
     def read_hourly_trends(self):
-        # Use mock data for instant response
-        logger.info("Using optimized mock data for hourly trends")
-        return self._get_mock_hourly_data()
+        df = self._read_parquet("by_hour")
+        if df is None:
+            logger.warning("Hourly aggregates missing; returning empty list")
+            return []
 
-    def _get_mock_hourly_data(self):
-        """Generate mock hourly data"""
-        import random
-        hours = []
-        for hour in range(24):
-            # Simulate realistic shopping patterns (higher during day, lower at night)
-            base_transactions = 50 + (200 * (0.5 + 0.5 * abs(12 - hour) / 12)) if 6 <= hour <= 22 else 20
-            transactions = int(base_transactions + random.randint(-30, 50))
-            revenue = transactions * random.uniform(3.5, 6.5)
-            hours.append({
-                "hour": hour,
-                "transaction_count": transactions,
-                "total_revenue": round(revenue, 2),
-                "avg_price": round(revenue / transactions, 2) if transactions > 0 else 0
+        df_latest = self._filter_latest_window(df)
+        rows = (
+            df_latest
+            .orderBy(F.col("hour_of_day"))
+            .collect()
+        )
+
+        if not rows:
+            logger.warning("No hourly aggregates available in latest window")
+            return []
+
+        hourly = []
+        for row in rows:
+            hourly.append({
+                "hour": int(row.hour_of_day or 0),
+                "hour_of_day": int(row.hour_of_day or 0),
+                "transaction_count": int(row.transaction_count or 0),
+                "total_revenue": round(float(row.total_revenue or 0.0), 2),
+                "avg_transaction_value": round(float(row.avg_transaction_value or 0.0), 2),
+                "avg_price": round(float(row.avg_transaction_value or 0.0), 2),
+                "active_users": int(row.active_users or 0),
+                "active_products": int(row.active_products or 0),
+                "window_start": row.window_start.isoformat() if getattr(row, "window_start", None) else None,
+                "window_end": row.window_end.isoformat() if getattr(row, "window_end", None) else None,
+                "processing_time": row.processing_time.isoformat() if getattr(row, "processing_time", None) else None
             })
-        return hours
+
+        return hourly
 
 data_reader = HDFSDataReader(HDFS_NAMENODE)
 

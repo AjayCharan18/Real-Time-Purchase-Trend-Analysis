@@ -8,7 +8,7 @@
 ##  **System Architecture**
 ### Architecture
 
- Instacart Dataset →  Kafka Producer →  Kafka → Spark Streaming →  HDFS →  Enhanced Dashboard
+Instacart Dataset (optional) → Kafka Producer → Kafka → Spark Streaming → HDFS → Flask Dashboard
 
 ### **Key Components:**
 - **Data Source**: Instacart purchase transactions (realistic retail data)
@@ -38,22 +38,34 @@ cd PURCHASE-TREND-ANALYSIS
 mkdir -p logs/producer logs/spark logs/dashboard caches/ivy2 caches/m2
 ```
 
-3. **Start infrastructure services**
+3. **(Optional) Add Instacart CSVs for real data mode**
+   Place the Instacart dataset CSVs inside `data/` before starting containers:
+
+   - `data/orders.csv`
+   - `data/products.csv`
+   - `data/order_products__prior.csv`
+   - `data/departments.csv`
+
+   By default the producer runs in `synthetic` mode (`PRODUCER_DATA_MODE=synthetic`).
+   To stream the real dataset, set `PRODUCER_DATA_MODE=auto` (or `real`) in
+   `docker-compose.yml` and ensure the CSV files exist at the paths above.
+
+4. **Start infrastructure services**
 ```bash
 docker compose up -d zookeeper kafka hadoop-namenode hadoop-datanode spark-master spark-worker
 ```
 
-4. **Verify services are healthy**
+5. **Verify services are healthy**
 ```bash
 docker compose ps
 ```
 
-5. **Create Kafka topic**
+6. **Create Kafka topic**
 ```bash
 docker compose exec kafka kafka-topics --bootstrap-server kafka:29092 --create --topic purchase-transactions --partitions 1 --replication-factor 1
 ```
 
-6. **Create HDFS directories**
+7. **Create HDFS directories**
 ```bash
 docker compose exec hadoop-namenode hdfs dfs -mkdir -p /purchase-analytics/raw
 docker compose exec hadoop-namenode hdfs dfs -mkdir -p /purchase-analytics/aggregated/by_product
@@ -61,18 +73,18 @@ docker compose exec hadoop-namenode hdfs dfs -mkdir -p /purchase-analytics/aggre
 docker compose exec hadoop-namenode hdfs dfs -mkdir -p /purchase-analytics/aggregated/by_hour
 ```
 
-7. **Build and start Spark streaming**
+8. **Build and start Spark streaming**
 ```bash
 docker compose build --no-cache spark-streaming
 docker compose up -d spark-streaming
 ```
 
-8. **Start data producer**
+9. **Start data producer**
 ```bash
 docker compose up -d producer
 ```
 
-9. **Monitor logs**
+10. **Monitor logs**
 ```bash
 # Producer logs
 docker compose logs -f producer
@@ -81,18 +93,18 @@ docker compose logs -f producer
 docker compose logs -f spark-streaming
 ```
 
-10. **Verify data flow (after ~1 minute)**
+11. **Verify data flow (after ~1 minute)**
 ```bash
 docker compose exec hadoop-namenode hdfs dfs -ls /purchase-analytics/raw
 docker compose exec hadoop-namenode hdfs dfs -ls /purchase-analytics/aggregated/by_product
 ```
 
-11. **Start dashboard**
+12. **Start dashboard**
 ```bash
 docker compose up -d dashboard
 ```
 
-12. **Access dashboard**
+13. **Access dashboard**
 Open http://localhost:5000 in your browser
 
 ## Configuration
@@ -146,8 +158,9 @@ All data stored in HDFS as Parquet files:
 Flask dashboard provides:
 - Real-time transaction volume
 - Top products by sales
-- Department performance
+- Department revenue distribution
 - Hourly sales trends
+- Alerting, PDF export, and Excel export tools
 
 ## Troubleshooting
 
@@ -217,10 +230,9 @@ docker compose exec spark-master ./bin/spark-class org.apache.spark.deploy.Clien
 
 ## Testing
 
-```bash
-# Run unit tests (if available)
-pytest
-```
+Automated tests have not been added yet. Contributions are welcome—add unit tests and
+integration tests (e.g., Spark job validation) under a future `tests/` directory and
+run them with `pytest` once available.
 
 ##  Support
 
