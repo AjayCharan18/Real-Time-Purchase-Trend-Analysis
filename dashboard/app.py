@@ -52,7 +52,7 @@ HDFS_DATA_PATH = os.getenv("HDFS_DATA_PATH", "/purchase-analytics/aggregated")
 UPDATE_INTERVAL = 30  # seconds - reduced for better performance
 
 # Cache manager configuration
-cache_manager = CacheManager(ttl=120, default_limit=50)
+cache_manager = CacheManager(ttl=30, default_limit=50)
 CACHE_DEFAULT_LIMIT = cache_manager.default_limit
 
 # Alert system configuration
@@ -223,37 +223,115 @@ class HDFSDataReader:
             logger.warning("Hourly aggregates missing at expected HDFS location")
             return []
 
+        try:
+            latest_window = (
+                df
+                .select(F.max("window_end").alias("max_window_end"))
+                .head()
+            )
+        except Exception as exc:
+            logger.warning(f"Unable to determine latest hourly window: {exc}")
+            return []
+
+        if not latest_window or not latest_window.max_window_end:
+            logger.warning("Hourly aggregates missing latest window_end value")
+            return []
+
+        cutoff_time = latest_window.max_window_end - timedelta(hours=24)
+        filtered_df = df.filter(F.col("window_end") >= F.lit(cutoff_time).cast("timestamp"))
+
+        bucketed_df = filtered_df.withColumn("hour_bucket", F.date_trunc("hour", F.col("window_end")))
+
         agg_df = (
-            df
-            .groupBy("hour_of_day")
+            bucketed_df
+            .groupBy("hour_bucket")
             .agg(
                 F.sum("transaction_count").alias("transaction_count"),
                 F.sum("total_revenue").alias("total_revenue"),
-                F.avg("avg_transaction_value").alias("avg_transaction_value"),
-                F.avg("avg_transaction_value").alias("avg_price"),
                 F.avg("active_users").alias("active_users"),
                 F.avg("active_products").alias("active_products")
             )
-            .orderBy("hour_of_day")
+            .withColumn(
+                "avg_transaction_value",
+                F.when(
+                    F.col("transaction_count") > 0,
+                    F.col("total_revenue") / F.col("transaction_count")
+                ).otherwise(0.0)
+            )
+            .select(
+                "hour_bucket",
+                "transaction_count",
+                "total_revenue",
+                "avg_transaction_value",
+                "active_users",
+                "active_products"
+            )
+            .orderBy("hour_bucket")
         )
 
         rows = agg_df.collect()
 
         if not rows:
-            logger.warning("No hourly aggregates available in latest window")
+            logger.warning("No hourly aggregates available in latest 24h window")
             return []
 
-        hourly = []
+        hourly_by_bucket = {}
+        latest_epoch = None
         for row in rows:
-            hourly.append({
-                "hour": int(row.hour_of_day or 0),
-                "hour_of_day": int(row.hour_of_day or 0),
+            bucket_dt = row.hour_bucket
+            if bucket_dt is None:
+                continue
+            if bucket_dt.tzinfo is not None:
+                bucket_dt = bucket_dt.replace(tzinfo=None)
+            bucket_dt = bucket_dt.replace(minute=0, second=0, microsecond=0)
+            epoch_hour = int(bucket_dt.timestamp() // 3600)
+
+            hourly_by_bucket[epoch_hour] = {
+                "timestamp": bucket_dt,
                 "transaction_count": int(row.transaction_count or 0),
-                "total_revenue": round(float(row.total_revenue or 0.0), 2),
-                "avg_transaction_value": round(float(row.avg_transaction_value or 0.0), 2),
-                "avg_price": round(float(row.avg_price or 0.0), 2),
-                "active_users": int(round(row.active_users or 0)),
-                "active_products": int(round(row.active_products or 0))
+                "total_revenue": float(row.total_revenue or 0.0),
+                "avg_transaction_value": float(row.avg_transaction_value or 0.0),
+                "active_users": float(row.active_users or 0.0),
+                "active_products": float(row.active_products or 0.0)
+            }
+
+            if latest_epoch is None or epoch_hour > latest_epoch:
+                latest_epoch = epoch_hour
+
+        if latest_epoch is None:
+            logger.warning("Unable to determine latest hourly epoch")
+            return []
+
+        start_epoch = latest_epoch - 23
+        hourly = []
+        for epoch in range(start_epoch, latest_epoch + 1):
+            bucket_dt = datetime.fromtimestamp(epoch * 3600)
+            entry_data = hourly_by_bucket.get(epoch)
+
+            if entry_data:
+                transaction_count = entry_data["transaction_count"]
+                total_revenue = entry_data["total_revenue"]
+                avg_transaction_value = entry_data["avg_transaction_value"]
+                active_users = entry_data["active_users"]
+                active_products = entry_data["active_products"]
+            else:
+                transaction_count = 0
+                total_revenue = 0.0
+                avg_transaction_value = 0.0
+                active_users = 0.0
+                active_products = 0.0
+
+            hourly.append({
+                "hour": bucket_dt.hour,
+                "hour_of_day": bucket_dt.hour,
+                "hour_label": bucket_dt.strftime("%H:%M"),
+                "timestamp": bucket_dt.isoformat(),
+                "transaction_count": int(transaction_count),
+                "total_revenue": round(float(total_revenue), 2),
+                "avg_transaction_value": round(float(avg_transaction_value), 2),
+                "avg_price": round(float(avg_transaction_value), 2),
+                "active_users": int(round(active_users or 0)),
+                "active_products": int(round(active_products or 0))
             })
 
         return hourly
@@ -269,6 +347,12 @@ def warmup_cache_async():
         'hourly': data_reader.read_hourly_trends,
     }
     CacheWarmupTask(cache_manager, loaders).start_async()
+
+
+try:
+    warmup_cache_async()
+except Exception as exc:
+    logger.warning(f"Cache warm-up skipped: {exc}")
 
 def _is_alert_in_cooldown(alert_key: str, now: datetime) -> bool:
     cooldown_seconds = ALERT_COOLDOWNS.get(alert_key, 600)
@@ -644,8 +728,12 @@ def create_excel_export():
     except Exception as e:
         logger.error(f"Error generating Excel export: {e}")
         return None
+
+
+@app.route('/')
 def index():
     return render_template('index.html')
+
 
 @app.route('/api/products/top')
 def api_top_products():
@@ -870,10 +958,10 @@ def export_status():
         "formats": ["pdf", "excel"]
     })
 
-# Financial API routes removed - focusing on core purchase trend analysis
 
 def background_updates():
     while True:
+        cache_manager.invalidate()
         products = data_reader.read_product_trends(20)
         depts = data_reader.read_department_trends()
         hourly = data_reader.read_hourly_trends()
